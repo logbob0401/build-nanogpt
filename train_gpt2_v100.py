@@ -9,6 +9,45 @@ from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from datetime import datetime
 import gc
+import tiktoken
+import numpy as np
+cels=nn.CrossEntropyLoss()
+
+
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 # -----------------------------------------------------------------------------
 
@@ -31,7 +70,8 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -39,7 +79,8 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
-        y = self.c_proj(y)
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
@@ -53,7 +94,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.gelu(x)
         x = self.c_proj(x)
         return x
 
@@ -67,8 +109,12 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        with torch.cuda.amp.autocast(enabled=False):
+            x1=self.ln_1(x)
+            x = x + self.attn(x1)
+        with torch.cuda.amp.autocast(enabled=False):
+            x2=self.ln_2(x)
+        x = x + self.mlp(x2)
         return x
 
 @dataclass
@@ -123,11 +169,13 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.transformer.ln_f(x)
+            logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            with torch.cuda.amp.autocast(enabled=False):
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
     @classmethod
@@ -201,15 +249,12 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == "cuda"
         if master_process:
             print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-6, fused=use_fused)
         return optimizer
 
 # -----------------------------------------------------------------------------
-import tiktoken
-import numpy as np
-ddp_local_rank = 0
-master_process = 1
-device = "cpu"
+
+
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
@@ -303,40 +348,6 @@ def get_most_likely_row(tokens, mask, logits):
 # DDP launch for e.g. 8 GPUs:
 # torchrun --standalone --nproc_per_node=2 train_gpt2.py
 
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # vanilla, non-DDP run
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
-
-# added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "cuda" if device.startswith("cuda") else "cpu"
 def get_supported_dtype():
     # 检测CUDA是否可用
     if not torch.cuda.is_available():
@@ -393,7 +404,7 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 if master_process:
     print(f"{use_compile=}")
-max_lr = 6e-4
+max_lr = 1e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 #+2000
 max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
@@ -412,6 +423,7 @@ def get_lr(it):
 
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+scaler = torch.cuda.amp.GradScaler()
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -536,35 +548,34 @@ def train():
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
-        norm=3
+        norm = 3
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
-            #x, y = x.to(device), y.to(device) # they should already in device
-            # added after video, this field is also used by the forward pass.
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             with torch.autocast(device_type=device_type, dtype=dtype):
                 logits, loss = model(x, y)
-            # we have to scale the loss to account for gradient accumulation,
-            # because the gradients just add on each successive backward().
-            # addition of gradients corresponds to a SUM in the objective, but
-            # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-            #loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            loss.backward()
-        loss_accum = loss_accum/grad_accum_steps
+            # 使用 scaler.scale() 来缩放损失并调用 backward()
+            scaler.scale(loss).backward()
+        # 平均累积的损失
+        loss_accum = loss_accum / grad_accum_steps
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        # 在优化器步骤之前，使用 scaler 来处理梯度缩放
+        # 梯度裁剪也需要在 unscale 之后进行
+        scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # determine and set the learning rate for this iteration
+        # 调整学习率
         lr = get_lr(step)
-       
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        optimizer.step()
+        # 使用 scaler.step() 代替 optimizer.step()
+        scaler.step(optimizer)
+        # 更新 scaler 的缩放因子
+        scaler.update()
         if device_type == "cuda":
-            torch.cuda.synchronize() # wait for the GPU to finish work
+            torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
