@@ -121,12 +121,20 @@ def iterate_examples(split):
 
 @torch.no_grad()
 def evaluate(model_type, device):
-
-    torch.set_float32_matmul_precision('high') # use tf32
-    model = GPT2LMHeadModel.from_pretrained(model_type)
+    import torch
+    import train_gpt2withgpt4tokenizer as tr4
+    
+    checkpoint = torch.load(os.path.join("log", "gpt4token+swilu.pt"), map_location=device)
+    # load the model state
+    model = tr4.GPT(checkpoint['config'])
     model.to(device)
+    model.load_state_dict(checkpoint['model'])
+    
+    torch.set_float32_matmul_precision('high') # use tf32
+    #model = GPT2LMHeadModel.from_pretrained(model_type)
+    #model.to(device)
     # model = torch.compile(model) # optionally torch compile the model
-
+    model.eval()
     num_correct_norm = 0
     num_correct = 0
     num_total = 0
