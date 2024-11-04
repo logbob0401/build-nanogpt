@@ -9,45 +9,6 @@ from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from datetime import datetime
 import gc
-import tiktoken
-import numpy as np
-cels=nn.CrossEntropyLoss()
-
-
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # vanilla, non-DDP run
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
-
-# added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 # -----------------------------------------------------------------------------
 
@@ -70,35 +31,176 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        with torch.autocast(device_type=device_type, dtype=dtype):
-            qkv = self.c_attn(x)
+        qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        with torch.cuda.amp.autocast(enabled=False):
+
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        #y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
-        with torch.autocast(device_type=device_type, dtype=dtype):
-            y = self.c_proj(y)
+        y = self.c_proj(y)
         return y
 
-class MLP(nn.Module):
+class _GroupedQueryAttention(nn.Module):
+    """
+    Implements the Grouped Query Attention (GQA) mechanism.
+    Optimized using Flash Attention.
 
+    Args:
+        config: Configuration object containing model parameters.
+            - config.n_embd: The embedding dimension (c).
+            - config.n_head: The number of attention heads (h).
+    """
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = nn.GELU(approximate='tanh')
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.dim = config.n_embd        # Input feature dimension (c)
+        self.num_heads = config.n_head  # Number of attention heads (h)
+        self.head_dim = self.dim // self.num_heads  # Dimension per head (d)
+
+        # Number of key-value heads is hardcoded to half of query heads
+        self.num_key_value_heads = self.num_heads // 2  # (kv_h)
+        # Number of key-value groups is 2 (since num_heads // num_key_value_heads = 2)
+        self.num_key_value_groups = 2
+
+        # Define linear projection layers
+        self.q_proj = nn.Linear(self.dim, self.num_heads * self.head_dim)
+        self.k_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim)
+        self.v_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.dim)
+
+        self.dropout = config.dropout
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Initialize parameters
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.o_proj.weight)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+            nn.init.zeros_(self.k_proj.bias)
+            nn.init.zeros_(self.v_proj.bias)
+            nn.init.zeros_(self.o_proj.bias)
+
+    def _repeat_kv(self, key: torch.Tensor, value: torch.Tensor):
+        """
+        Repeat key and value tensors to match the number of query heads.
+        Assumes num_key_value_groups = 2.
+
+        Args:
+            key: Key tensor of shape (b, t, kv_h, d)
+            value: Value tensor of shape (b, t, kv_h, d)
+
+        Returns:
+            key: Repeated key tensor of shape (b, t, h, d)
+            value: Repeated value tensor of shape (b, t, h, d)
+        """
+        if self.num_key_value_groups == 1:
+            return key, value
+
+        b, t, kv_h, d = key.size()
+
+        # Expand key tensor without actual data copying
+        key = key.unsqueeze(2)                      # (b, t, 1, kv_h, d)
+        key = key.expand(-1, -1, 2, -1, -1)         # (b, t, 2, kv_h, d)
+        key = key.reshape(b, t, self.num_heads, d)  # (b, t, h, d)
+
+        # Do the same for value tensor
+        value = value.unsqueeze(2).expand(-1, -1, 2, -1, -1).reshape(b, t, self.num_heads, d)
+
+        return key, value
+
+    def forward(self, x, attention_mask=None, use_cache=False):
+        """
+        Forward pass for the GQA layer.
+
+        Args:
+            x: Input tensor of shape (b, t, c)
+            attention_mask: Optional attention mask tensor.
+            use_cache: Whether to use and return cache.
+
+        Returns:
+            output: Output tensor of shape (b, t, c)
+            past_key_value: Tuple of key and value tensors if use_cache is True
+        """
+        b, t, c = x.shape  # x: (b, t, c)
+
+        # Compute queries, keys, and values
+        q = self.q_proj(x)  # q: (b, t, h * d)
+        k = self.k_proj(x)  # k: (b, t, kv_h * d)
+        v = self.v_proj(x)  # v: (b, t, kv_h * d)
+
+        # Reshape to separate heads
+        q = q.view(b, t, self.num_heads, self.head_dim)           # q: (b, t, h, d)
+        k = k.view(b, t, self.num_key_value_heads, self.head_dim) # k: (b, t, kv_h, d)
+        v = v.view(b, t, self.num_key_value_heads, self.head_dim) # v: (b, t, kv_h, d)
+
+        # Repeat keys and values to match query heads
+        k, v = self._repeat_kv(k, v)  # Now k, v: (b, t, h, d)
+
+        # Transpose for attention computation
+        q = q.transpose(1, 2)  # q: (b, h, t, d)
+        k = k.transpose(1, 2)  # k: (b, h, t, d)
+        v = v.transpose(1, 2)  # v: (b, h, t, d)
+
+        # Use Flash Attention if available
+        if (torch.backends.cuda.flash_attention_available
+            and q.is_cuda
+            and q.dtype in [torch.float16, torch.bfloat16]):
+            # Flash Attention computes attention efficiently
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,  # Should be of shape (b, 1, t, t) or broadcastable
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False  # Set to True if causal masking is needed
+            )  # attn_output: (b, h, t, d)
+        else:
+            # Standard attention computation
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (b, h, t, t)
+            if attention_mask is not None:
+                scores += attention_mask  # Apply attention mask
+            attn_weights = F.softmax(scores, dim=-1)  # (b, h, t, t)
+            attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, v)  # (b, h, t, d)
+
+        # Transpose and reshape to merge heads
+        attn_output = attn_output.transpose(1, 2).reshape(b, t, c)  # (b, t, c)
+
+        # Final linear projection
+        output = self.o_proj(attn_output)  # (b, t, c)
+
+        if use_cache:
+            # Return key and value tensors for caching
+            past_key_value = (k, v)  # Each of shape (b, h, t, d)
+            return output, past_key_value
+
+        return output, None
+    
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # SwiGLU uses 2/3 * 4 = 8/3 times the input dim for hidden layer
+        #hidden_dim = int(8/3 * config.n_embd)
+        hidden_dim = 2 * config.n_embd
+        self.w1 = nn.Linear(config.n_embd, hidden_dim)
+        self.w2 = nn.Linear(config.n_embd, hidden_dim)
+        self.c_proj = nn.Linear(hidden_dim  , config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
+        x1 = self.w1(x)
+        x2 = self.w2(x)
         with torch.cuda.amp.autocast(enabled=False):
-            x = self.gelu(x)
-        x = self.c_proj(x)
+            hidden = F.silu(x1) * x2  # SwiGLU activation
+        x = self.c_proj(hidden)
         return x
-
+    
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -111,7 +213,7 @@ class Block(nn.Module):
     def forward(self, x):
         with torch.cuda.amp.autocast(enabled=False):
             x1=self.ln_1(x)
-            x = x + self.attn(x1)
+        x = x + self.attn(x1)
         with torch.cuda.amp.autocast(enabled=False):
             x2=self.ln_2(x)
         x = x + self.mlp(x2)
@@ -130,7 +232,8 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-
+        print(f"init gpt with {config.n_layer=}, {config.n_head=}, {config.n_embd=},{config.vocab_size=}")
+        # input embedding stem
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -171,11 +274,10 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         with torch.cuda.amp.autocast(enabled=False):
             x = self.transformer.ln_f(x)
-            logits = self.lm_head(x) # (B, T, vocab_size)
+        logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            with torch.cuda.amp.autocast(enabled=False):
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
     @classmethod
@@ -249,12 +351,15 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == "cuda"
         if master_process:
             print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-6, fused=use_fused)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
 # -----------------------------------------------------------------------------
-
-
+import tiktoken
+import numpy as np
+ddp_local_rank = 0
+master_process = 1
+device = "cpu"
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
@@ -265,7 +370,7 @@ class DataLoaderLite:
         self.split=split
         self.rng=np.random.default_rng(1337)
         # get the shard filenames
-        data_root = "edu_fineweb10B"
+        data_root = "edu_fineweb10B_gpt4_enc"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
@@ -348,6 +453,40 @@ def get_most_likely_row(tokens, mask, logits):
 # DDP launch for e.g. 8 GPUs:
 # torchrun --standalone --nproc_per_node=2 train_gpt2.py
 
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 def get_supported_dtype():
     # 检测CUDA是否可用
     if not torch.cuda.is_available():
@@ -376,10 +515,14 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-enc = tiktoken.get_encoding("gpt2")
-model_config=GPTConfig(vocab_size=50304)
+#enc = tiktoken.get_encoding("gpt2")
+#instead of use gpt2 tokenizer and vocabulary, we make a hack--use cl100k_base tokenizer and vocabulary
+enc = tiktoken.get_encoding("cl100k_base")
+
+model_config=GPTConfig(n_layer=16, n_head=16, n_embd=1024,vocab_size=100288)
+#model_config=GPTConfig(vocab_size=50304)
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
+B =32 # micro batch size
 T = model_config.block_size # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -396,7 +539,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(model_config)
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = False # True  # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = False #True   # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -404,9 +547,9 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 if master_process:
     print(f"{use_compile=}")
-max_lr = 1e-4
+max_lr = 4e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 #+2000
+warmup_steps = 1000 # 715 #+2000
 max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -422,8 +565,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-scaler = torch.cuda.amp.GradScaler()
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -548,35 +690,35 @@ def train():
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
-        norm = 3
+        norm=3
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
+            #x, y = x.to(device), y.to(device) # they should already in device
+            # added after video, this field is also used by the forward pass.
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             with torch.autocast(device_type=device_type, dtype=dtype):
                 logits, loss = model(x, y)
-            loss=loss / grad_accum_steps
+            # we have to scale the loss to account for gradient accumulation,
+            # because the gradients just add on each successive backward().
+            # addition of gradients corresponds to a SUM in the objective, but
+            # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+            loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            # 使用 scaler.scale() 来缩放损失并调用 backward()
-            scaler.scale(loss).backward()
-        # 平均累积的损失
-        #loss_accum = loss_accum / grad_accum_steps
+            loss.backward()
+        #loss_accum = loss_accum/grad_accum_steps
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-        # 在优化器步骤之前，使用 scaler 来处理梯度缩放
-        # 梯度裁剪也需要在 unscale 之后进行
-        scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # 调整学习率
+        
+        # determine and set the learning rate for this iteration
         lr = get_lr(step)
+       
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        # 使用 scaler.step() 代替 optimizer.step()
-        scaler.step(optimizer)
-        # 更新 scaler 的缩放因子
-        scaler.update()
+        optimizer.step()
         if device_type == "cuda":
-            torch.cuda.synchronize()
+            torch.cuda.synchronize() # wait for the GPU to finish work
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
@@ -586,10 +728,7 @@ def train():
             print(str)
             log1.write(f"{step} train {loss_accum.item():.6f}\n" )
             rec1.write(str+"\n" )
-            log1.flush()
-            rec1.flush()
             
-
 try:
     train()
 finally:
@@ -597,6 +736,8 @@ finally:
     if ddp:
         destroy_process_group()
     if log1:
+        log1.flush()
         log1.close()
     if rec1:
+        rec1.flush()
         rec1.close()
