@@ -59,7 +59,8 @@ hellaswags = {
     "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
 }
 
-enc = tiktoken.get_encoding("gpt2")
+#enc_gpt2 = tiktoken.get_encoding("gpt2")
+enc_gpt4 = tiktoken.get_encoding("cl100k_base")
 
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
@@ -70,7 +71,7 @@ def download(split):
         print(f"Downloading {data_url} to {data_filename}...")
         download_file(data_url, data_filename)
 
-def render_example(example):
+def render_example(example,enc=enc_gpt4):
     """
     Given the example as a dictionary, render it as three torch tensors:
     - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
@@ -94,7 +95,8 @@ def render_example(example):
     tok_rows = []
     mask_rows = []
     for end in endings:
-        end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
+        #end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
+        end_tokens = enc.encode(  end) # ok for gpt4 tokenizer
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens))
         data["ending_tokens"].append(end_tokens)
@@ -129,7 +131,7 @@ def evaluate(model_type, device):
     num_correct = 0
     num_total = 0
     for example in iterate_examples("val"):
-        data, tokens, mask, label = render_example(example)
+        data, tokens, mask, label = render_example(example,enc_gpt4)
         tokens = tokens.to(device)
         mask = mask.to(device)
 

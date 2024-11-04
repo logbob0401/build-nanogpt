@@ -9,10 +9,14 @@ from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from datetime import datetime
 import gc
-
+import tiktoken
+import numpy as np
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 # -----------------------------------------------------------------------------
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention_MHA(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -45,7 +49,8 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-class _GroupedQueryAttention(nn.Module):
+#GQA=GroupedQueryAttention
+class CausalSelfAttention_GQA(nn.Module):
     """
     Implements the Grouped Query Attention (GQA) mechanism.
     Optimized using Flash Attention.
@@ -57,9 +62,11 @@ class _GroupedQueryAttention(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
-        self.dim = config.n_embd        # Input feature dimension (c)
+        self.n_embd = config.n_embd        # Input feature dimension (c)
         self.num_heads = config.n_head  # Number of attention heads (h)
-        self.head_dim = self.dim // self.num_heads  # Dimension per head (d)
+        assert config.n_embd % config.n_head == 0, "Embedding dimension must be divisible by number of heads"
+        
+        self.head_dim = self.n_embd // self.num_heads  # Dimension per head (d)
 
         # Number of key-value heads is hardcoded to half of query heads
         self.num_key_value_heads = self.num_heads // 2  # (kv_h)
@@ -67,12 +74,10 @@ class _GroupedQueryAttention(nn.Module):
         self.num_key_value_groups = 2
 
         # Define linear projection layers
-        self.q_proj = nn.Linear(self.dim, self.num_heads * self.head_dim)
-        self.k_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim)
-        self.v_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.dim)
-
-        self.dropout = config.dropout
+        self.q_proj = nn.Linear(self.n_embd, self.n_embd)
+        self.k_proj = nn.Linear(self.n_embd, self.n_embd//2)
+        self.v_proj = nn.Linear(self.n_embd, self.n_embd//2)
+        self.o_proj = nn.Linear(self.n_embd, self.n_embd)
 
         self._reset_parameters()
 
@@ -150,17 +155,14 @@ class _GroupedQueryAttention(nn.Module):
         v = v.transpose(1, 2)  # v: (b, h, t, d)
 
         # Use Flash Attention if available
-        if (torch.backends.cuda.flash_attention_available
-            and q.is_cuda
-            and q.dtype in [torch.float16, torch.bfloat16]):
-            # Flash Attention computes attention efficiently
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask,  # Should be of shape (b, 1, t, t) or broadcastable
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False  # Set to True if causal masking is needed
-            )  # attn_output: (b, h, t, d)
-        else:
+        
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            #attn_mask=attention_mask,  # Should be of shape (b, 1, t, t) or broadcastable
+            #dropout_p=0.0, #self.dropout if self.training else 
+            is_causal=True  # Set to True if causal masking is needed
+        )  # attn_output: (b, h, t, d)
+        if 0:
             # Standard attention computation
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (b, h, t, t)
             if attention_mask is not None:
@@ -180,8 +182,9 @@ class _GroupedQueryAttention(nn.Module):
             past_key_value = (k, v)  # Each of shape (b, h, t, d)
             return output, past_key_value
 
-        return output, None
-    
+        return output  #, None
+
+CausalSelfAttention = CausalSelfAttention_GQA
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -232,7 +235,6 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        print(f"init gpt with {config.n_layer=}, {config.n_head=}, {config.n_embd=},{config.vocab_size=}")
         # input embedding stem
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -355,8 +357,7 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
-import tiktoken
-import numpy as np
+
 ddp_local_rank = 0
 master_process = 1
 device = "cpu"
@@ -396,7 +397,16 @@ class DataLoaderLite:
         self.current_shard = 0
         self.tokens = self.load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
-
+        # set the data loader to a specific state (from a checkpoint)
+    def set_from_checkpoint(self, loader_checkpoint):
+        self.current_position = loader_checkpoint['current_position'] + self.B * self.T * self.process_rank # we add the B*T*process_rank to the position to make sure it is the correct position for each process
+        self.current_shard = loader_checkpoint['current_shard']
+        self.tokens = self.load_tokens(self.shards[self.current_shard]) 
+        # if loading the next batch will exceed the tokens, reset the position and load the next shard
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = self.load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
     def next_batch(self):
         B, T = self.B, self.T
         # if loading the next batch would be out of bounds, advance to next shard
@@ -454,9 +464,6 @@ def get_most_likely_row(tokens, mask, logits):
 # torchrun --standalone --nproc_per_node=2 train_gpt2.py
 
 # run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -508,6 +515,7 @@ def get_supported_dtype():
 
 # 使用示例
 dtype = get_supported_dtype()
+
 if master_process:
     print(f"Selected data type: {dtype}")
 
@@ -519,10 +527,10 @@ if torch.cuda.is_available():
 #instead of use gpt2 tokenizer and vocabulary, we make a hack--use cl100k_base tokenizer and vocabulary
 enc = tiktoken.get_encoding("cl100k_base")
 
-model_config=GPTConfig(n_layer=16, n_head=16, n_embd=1024,vocab_size=100288)
+model_config=GPTConfig(n_layer=12, n_head=16, n_embd=1024,vocab_size=100288)
 #model_config=GPTConfig(vocab_size=50304)
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B =32 # micro batch size
+B =8 # micro batch size
 T = model_config.block_size # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -535,10 +543,42 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 
 torch.set_float32_matmul_precision('high')
 
-# create model
-model = GPT(model_config)
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
-model.to(device)
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+
+# Start or Resume training
+resume_training = True #False
+if resume_training:
+    # get the latest checkpoint file
+    checkpoint_files = [f for f in os.listdir(log_dir) if f.startswith("model_") and f.endswith(".pt")]
+    assert len(checkpoint_files) > 0, "no checkpoints found to resume training from"
+    checkpoint_file = sorted(checkpoint_files)[-1]
+    if master_process:
+        print(f"resuming training from checkpoint {checkpoint_file}")
+    checkpoint = torch.load(os.path.join(log_dir, checkpoint_file), map_location=device)
+    # load the model state
+    model = GPT(checkpoint['config'])
+    model.to(device)
+    model.load_state_dict(checkpoint['model'])
+    
+    # load the step (which will determine the learning rate in the scheduler)
+    current_step = checkpoint['step'] + 1
+    # load the training data loader state
+    train_loader.set_from_checkpoint(checkpoint['train_loader'])
+    if master_process:
+        print(f"resuming training from step {current_step} with a validation loss of {checkpoint['val_loss']:.4f}")
+else:
+    # create model
+    model = GPT(model_config)
+    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    model.to(device)
+    current_step = 0
+    if master_process:
+        print(f"training from scatch with {model_config=}")
+
+
 use_compile = False #True   # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
@@ -567,20 +607,15 @@ def get_lr(it):
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
 
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-
-current_datetime = datetime.now().strftime("%Y%m%d%H%M")
+current_datetime = datetime.now().strftime("%m%d%H%M")
 
 # Create filenames with date and time information
-log_file = os.path.join(log_dir, f"log_{current_datetime}.txt")
 rec_file = os.path.join(log_dir, f"rec_{current_datetime}.txt")
 log1=open(log_file, "w")
 rec1=open(rec_file, "w")
 
 def train():
-    for step in range(max_steps):
+    for step in range(current_step,max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
 
@@ -607,16 +642,17 @@ def train():
                 log1.write(f"{step} val {val_loss_accum.item():.4f}\n")
                 if step > 0 and (step % 5000 == 0 or last_step):
                     # optionally write model checkpoints
-                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                     checkpoint = {
                         'model': raw_model.state_dict(),
                         'config': raw_model.config,
                         'step': step,
-                        'val_loss': val_loss_accum.item()
+                        'val_loss': val_loss_accum.item(),
+                        'train_loader': {'current_shard': train_loader.current_shard, 'current_position': train_loader.current_position},
+                        #'optimizer': optimizer.state_dict(),
                     }
                     # you might also want to add optimizer.state_dict() and
                     # rng seeds etc., if you wanted to more exactly resume training
-                    torch.save(checkpoint, checkpoint_path)
+                    torch.save(checkpoint, os.path.join(log_dir, f"model_{step:05d}.pt"))
 
         # once in a while evaluate hellaswag
         if (step % 250 == 0 or last_step) and (not use_compile):
@@ -627,7 +663,7 @@ def train():
                 if i % ddp_world_size != ddp_rank:
                     continue
                 # render the example into tokens and labels
-                _, tokens, mask, label = render_example(example)
+                _, tokens, mask, label = render_example(example,enc)
                 tokens = tokens.to(device)
                 mask = mask.to(device)
                 # get the logits

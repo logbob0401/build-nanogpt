@@ -1,5 +1,12 @@
 ## GPU 现存利用率不高，只有26%（对h800）
-### 发现！ 
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+memory.used [MiB], memory.total [MiB]
+22001 MiB, 81559 MiB
+22001 MiB, 81559 MiB
+### 优化空间300%, 
+### (Done)尝试加大batch 16->64(good)->128(oom)
+### after update batch  to 64, tok/s increase to 565k/s, memory used about 79GB+, use rate increase from 26p to 97p
+## fp16训练问题 
 v100上没有bf16只能用fp16，而且mem小只能用小batch 16 （wordsize 8,T 1024,grad_accum_steps 4），结果导致训练不稳定;
 我怀疑fp16更直接有问题。
 -->用h800 batch 16+ bf16 没问题
@@ -18,13 +25,7 @@ QQQ: how about adjust lr based on norm?
 --> GradScaler,在敏感层使用 FP32 计算(laynorm,softmax,gelu),调整学习率到1/6: 刚只是在laynorm+gelu用了fp32，稳定性已经有明显改善,但是在3000+ step之后loss不再降低；这次softmax部分也用上。==>还是不行，loss到了3.5就不降低了,update:17249 train 3.324421, 降低的比fp32和bf16都慢，但还是有效果的；随着更多地方用fp32，tok/sec降低了约一半: 235k/s。看起来可以优化，但是需要更多训练时间才可以降低loss更多；==> 整体认为还是成功的。rec_202411011055_basically_works
 
 
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv
-memory.used [MiB], memory.total [MiB]
-22001 MiB, 81559 MiB
-22001 MiB, 81559 MiB
-### 优化空间300%, 
-### (Done)尝试加大batch 16->64(good)->128(oom)
-### after update batch  to 64, tok/s increase to 565k/s, memory used about 79GB+, use rate increase from 26p to 97p
+
 step   498 | loss: 5.180400 | lr 4.1874e-04 | norm: 1.0096 | dt: 927.33ms | tok/sec: 565373.84
 step   499 | loss: 5.164181 | lr 4.1958e-04 | norm: 1.1487 | dt: 928.54ms | tok/sec: 564638.99
 validation loss: 5.3183
@@ -63,7 +64,7 @@ https://github.com/karpathy/build-nanogpt/pull/72/files
 # (done)improve log, add more info
 
 
-# add load check point and resume part
+# (done) add load check point and resume part
 https://github.com/karpathy/build-nanogpt/pull/83/files
 
 
