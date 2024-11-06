@@ -60,7 +60,7 @@ hellaswags = {
 }
 
 #enc_gpt2 = tiktoken.get_encoding("gpt2")
-enc_gpt4 = tiktoken.get_encoding("cl100k_base")
+enc_gpt4 = None #tiktoken.get_encoding("cl100k_base")
 
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
@@ -71,6 +71,30 @@ def download(split):
         print(f"Downloading {data_url} to {data_filename}...")
         download_file(data_url, data_filename)
 
+# -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+
 def render_example(example,enc=enc_gpt4):
     """
     Given the example as a dictionary, render it as three torch tensors:
@@ -78,6 +102,7 @@ def render_example(example,enc=enc_gpt4):
     - mask (is 1 in the region of the candidate completion, where we evaluate likelihoods)
     - label (the index of the correct completion, which we hope has the highest likelihood)
     """
+    #print(f"Rendering example...")
     ctx = example["ctx"]
     label = example["label"]
     endings = example["endings"]
@@ -122,11 +147,13 @@ def iterate_examples(split):
 @torch.no_grad()
 def evaluate(model_type, device):
     import torch
-    import train_gpt2withgpt4tokenizer as tr4
-    
+    #import train_gpt2withgpt4tokenizer as tr4
+    from train_gpt2withgpt4tokenizer import GPTConfig,GPT
     checkpoint = torch.load(os.path.join("log", "gpt4token+swilu.pt"), map_location=device)
     # load the model state
-    model = tr4.GPT(checkpoint['config'])
+    model_config=GPTConfig(n_layer=12, n_head=16, n_embd=1024,vocab_size=100288)
+    model = GPT(model_config ) #GPTConfig(**checkpoint['config']))
+    #model = tr4.GPT(checkpoint['config'])
     model.to(device)
     model.load_state_dict(checkpoint['model'])
     
@@ -145,24 +172,8 @@ def evaluate(model_type, device):
 
         # get the logits
         logits = model(tokens).logits
-        # evaluate the autoregressive loss at all positions
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-        shift_losses = shift_losses.view(tokens.size(0), -1)
-        # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-        masked_shift_losses = shift_losses * shift_mask
-        # sum and divide by the number of 1s in the mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-        # now we have a loss for each of the 4 completions
-        # the one with the lowest loss should be the most likely
-        pred = sum_loss.argmin().item()
-        pred_norm = avg_loss.argmin().item()
-
+        pred_norm=get_most_likely_row(tokens, mask, logits)
+        
         # accumulate stats
         num_total += 1
         num_correct += int(pred == label)

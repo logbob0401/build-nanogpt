@@ -24,8 +24,6 @@ QQQ: how about adjust lr based on norm?
 --> frustrate, so let me try back to no cast： no problem
 --> GradScaler,在敏感层使用 FP32 计算(laynorm,softmax,gelu),调整学习率到1/6: 刚只是在laynorm+gelu用了fp32，稳定性已经有明显改善,但是在3000+ step之后loss不再降低；这次softmax部分也用上。==>还是不行，loss到了3.5就不降低了,update:17249 train 3.324421, 降低的比fp32和bf16都慢，但还是有效果的；随着更多地方用fp32，tok/sec降低了约一半: 235k/s。看起来可以优化，但是需要更多训练时间才可以降低loss更多；==> 整体认为还是成功的。rec_202411011055_basically_works
 
-
-
 step   498 | loss: 5.180400 | lr 4.1874e-04 | norm: 1.0096 | dt: 927.33ms | tok/sec: 565373.84
 step   499 | loss: 5.164181 | lr 4.1958e-04 | norm: 1.1487 | dt: 928.54ms | tok/sec: 564638.99
 validation loss: 5.3183
@@ -34,6 +32,8 @@ step   500 | loss: 5.209949 | lr 4.2042e-04 | norm: 1.0975 | dt: 25602.18ms | to
 step   501 | loss: 5.164941 | lr 4.2126e-04 | norm: 0.8869 | dt: 929.10ms | tok/sec: 564293.86
     和context
 ### 尝试更大的模型
+## todo: fp8 训练,用h800
+## todo: deepspeed, 
 
 # 数据load可能有太耗时问题，尝试用数据预取（Data Prefetching）或异步数据加载（Asynchronous Data Loading）优化
 注意load新batch的和新shard的耗时

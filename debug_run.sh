@@ -40,9 +40,10 @@ echo "=== 启动分布式训练 ==="
 #torchrun --nproc_per_node=8 train_gpt2.py
 #python3 train_gpt2.py
 #python3 train_gpt2withgpt4tokenizer.py
-#torchrun --nproc_per_node=2 train_gpt2withgpt4tokenizer.py
+#torchrun --nproc_per_node=8 train_gpt2withgpt4tokenizer.py
+#torchrun --standalone  --nproc_per_node=8 train_fsdp_gqa.py 
 #mlx worker  launch --gpu 8  --memory 64 -- bash /mnt/bn/bozhang41/build-nanogpt/debug_run.sh 
-#
+#torchrun --nproc_per_node=NUM_GPUS train_gpt2.py
 #mlx worker  launch --memory 64  --gpu 2  --type h800 -- bash /mnt/bn/bozhang41/build-nanogpt/debug_run.sh 
 #python3 minimal_gpt2_inference.py
 #python3 minimal_gpt2_inference_ddp.py
