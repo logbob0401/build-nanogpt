@@ -17,6 +17,7 @@ import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
+    FlatParameter,
     BackwardPrefetch,
     ShardingStrategy,
     CPUOffload,
@@ -36,6 +37,7 @@ import logging
 from functools import partial
 import functools
 from contextlib import nullcontext
+from utils import get_supported_dtype,define_logger
 ddp_local_rank = 0
 device = "cpu"
 # 确定是否为主进程
@@ -45,58 +47,7 @@ print(f"{master_process=}")
 
 log_dir = "log"
 
-def define_logger():
-    logger = logging.getLogger("GPTTraining")
-    # 配置日志记录器
-    logger.setLevel(logging.DEBUG if master_process else logging.CRITICAL)  # 非主进程设为 CRITICAL，不输出内容
-
-    
-    os.makedirs(log_dir, exist_ok=True)
-    # Logging setup
-    current_datetime = datetime.now().strftime("%m%d%H%M")
-    rec_file = os.path.join(log_dir, f"rec_{current_datetime}.txt")
-    # 设置第一个文件处理器并输出到控制台
-    file_handler_1 = logging.FileHandler(rec_file)
-    file_handler_1.setLevel(logging.DEBUG)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-
-    # 设置简洁的日志格式（只输出消息内容）
-    simple_format = logging.Formatter("%(message)s")
-    file_handler_1.setFormatter(simple_format)
-    console_handler.setFormatter(simple_format)
-
-    # 添加第一个处理器到日志记录器
-    logger.addHandler(file_handler_1)
-    logger.addHandler(console_handler)
-    return logger
-
-logger=define_logger()
-
-if torch.cuda.is_available():
-    logger.info("Available GPUs:")
-    for i in range(torch.cuda.device_count()):
-        logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-
-# -----------------------------------------------------------------------------
-def get_supported_dtype(device):
-    # 检测CUDA是否可用
-    if not torch.cuda.is_available():
-        logger.info("CUDA is not available. Using default float32.")
-        return torch.float32
-
-    # 获取当前设备（GPU）,in ddp this should be 'cuda:{ddp_local_rank}'
-    if torch.cuda.get_device_capability(device) >= (8, 0):
-        # 大部分支持BFloat16的GPU属于8.0或更高版本架构
-        if torch.cuda.is_bf16_supported():
-            
-            return torch.bfloat16
-        else:
-            
-            return torch.float16
-    else:
-        
-        return torch.float16
+logger=define_logger(master_process,log_dir)
 
 class CausalSelfAttention_MHA(nn.Module):
 
@@ -440,9 +391,28 @@ class GPT(nn.Module):
                     logger.info(f"    Dim: {param.dim()}")
             
         # 3. 分类参数
-        decay_params = [p for n, p in grad_params.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in grad_params.items() if p.dim() < 2]
+        nodecay_params=[]
+        decay_params=[]
         
+        for name, param in grad_params.items():
+            # 检查是否是 `FlatParameter`
+            if isinstance(param, FlatParameter):
+                # 如果是 flat_param，根据原始参数名称来分组
+                logger.info("\n=== flat_param in FSDP===")
+                for orig_param in param._param_infos: 
+                    orig_name = orig_param.module_name  
+                    if "weight" in orig_name and not any(x in orig_name for x in ["ln_","bias", "LayerNorm", "layer_norm"]):
+                        decay_params.append(param)
+                    else:
+                        nodecay_params.append(param)
+            else:
+                #logger.info(name)
+                # 如果不是 flat_param，直接按常规方式分组
+                if "weight" in name and not any(x in name for x in ["ln_","bias", "LayerNorm", "layer_norm"]):
+                    decay_params.append(param)
+                else:
+                    nodecay_params.append(param)
+
         logger.info("\n=== Parameter Groups ===")
         logger.info(f"Decay parameters: {len(decay_params)}")
         logger.info(f"No-decay parameters: {len(nodecay_params)}")
@@ -565,7 +535,6 @@ def setup_distributed():
             device = "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
-        logger.info(f"using device: {device}")
 
     device_type = "cuda" if device.startswith("cuda") else "cpu"
     return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, device_type
@@ -582,10 +551,9 @@ def get_fsdp_config(model_config):
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             Block,  # 确保这是你的 Block 类
-            CausalSelfAttention,  # 添加注意力层
-            MLP,  # 添加 MLP 层
-        },
-        #min_num_params=1000  # 可以调整这个阈值
+            #CausalSelfAttention,  # 添加注意力层
+            #MLP,  # 添加 MLP 层
+        }
     )
 
     # 2. 配置混合精度
@@ -601,12 +569,12 @@ def get_fsdp_config(model_config):
     fsdp_config = {
         "mixed_precision": mixed_precision_policy,
         "sharding_strategy": ShardingStrategy.FULL_SHARD,  # 或者考虑 SHARD_GRAD_OP
-        "auto_wrap_policy": transformer_wrap_policy,
-        "device_id": torch.cuda.current_device(),
-        "sync_module_states": True,  # 确保模块状态同步
-        "forward_prefetch": True,
-        "backward_prefetch": BackwardPrefetch.BACKWARD_POST,
-        "limit_all_gathers": True,
+        #"auto_wrap_policy": transformer_wrap_policy,
+        #"device_id": torch.cuda.current_device(),
+        #"sync_module_states": True,  # 确保模块状态同步
+        #"forward_prefetch": True,
+        #"backward_prefetch": BackwardPrefetch.BACKWARD_POST,
+        #"limit_all_gathers": True,
     }
 
     return fsdp_config
@@ -645,7 +613,7 @@ if ddp:
 
 #model_config=GPTConfig(vocab_size=50304)
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B =16 # micro batch size
+B =8 # micro batch size
 T = model_config.block_size # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -677,7 +645,7 @@ if resume_training:
     model = GPT(model_config)
     model.to(device)
     if ddp:
-        model = FSDP(model, **fsdp_config)
+        model = FSDP(model, **fsdp_config,use_orig_params=True,auto_wrap_policy=size_based_auto_wrap_policy)
     
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
     optimizer = model.module.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
@@ -693,8 +661,8 @@ else:
     model = GPT(model_config)
     model.to(device)
     if ddp:
-        model = DDP(model) #,  , ,**fsdp_config
-    
+        model = FSDP(model, use_orig_params=True) #,  , , ,**fsdp_config
+        #model = DDP(model,device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
     logger.info(f"training from scratch with {model_config=}")
 
@@ -829,7 +797,7 @@ def train():
                 logger.info(f"rank {ddp_rank} sample {i}: {decoded}")
 
         # do one step of the optimization
-  
+        
         model.train()
         torch.cuda.empty_cache()
         # 在梯度累积开始前清零梯度
@@ -838,13 +806,10 @@ def train():
         
         # 使用 no_sync 上下文管理器进行梯度累积
         for micro_step in range(grad_accum_steps):
-            # 对于除最后一个微批次外的所有批次，不进行梯度同步
-            context = model.no_sync() if micro_step < grad_accum_steps - 1 else nullcontext()
-            
-            with context:
-                x, y = train_loader.next_batch()
-                
-                # 使用自动混合精度
+            grad_context = ( nullcontext() if  micro_step == grad_accum_steps - 1 else model.no_sync() )
+            x, y = train_loader.next_batch()
+            # 使用自动混合精度
+            with grad_context:
                 with torch.autocast(device_type=device_type, dtype=dtype):
                     logits, loss = model(x, y)
                 # 缩放损失以考虑梯度累积
@@ -855,12 +820,16 @@ def train():
                 
                 # 反向传播
                 scaler.scale(loss).backward()
-        
+
+        if ddp and isinstance(model, FSDP):
+            torch.cuda.synchronize()
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         # 梯度裁剪前进行 unscale
         scaler.unscale_(optimizer)
         
         # 梯度裁剪
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm=model.clip_grad_norm_(1.0)
+        #norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         # 更新学习率
         lr = get_lr(step)
