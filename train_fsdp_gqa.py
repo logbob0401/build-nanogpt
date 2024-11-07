@@ -22,7 +22,10 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     CPUOffload,
     StateDictType,
+
 )
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullStateDictConfig,
     StateDictConfig,
@@ -364,7 +367,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+    def configure_optimizers(self,model, weight_decay, learning_rate, device_type):
         # 详细的参数统计
         logger.info("\n=== Parameter Analysis ===")
         
@@ -393,21 +396,21 @@ class GPT(nn.Module):
         # 3. 分类参数
         nodecay_params=[]
         decay_params=[]
-        
-        for name, param in grad_params.items():
-            # 检查是否是 `FlatParameter`
-            if isinstance(param, FlatParameter):
-                # 如果是 flat_param，根据原始参数名称来分组
-                logger.info("\n=== flat_param in FSDP===")
-                for orig_param in param._param_infos: 
-                    orig_name = orig_param.module_name  
-                    if "weight" in orig_name and not any(x in orig_name for x in ["ln_","bias", "LayerNorm", "layer_norm"]):
-                        decay_params.append(param)
-                    else:
+        fpn, fp = next(iter(grad_params.items()))
+        #print(fpn,fp)
+        if len(grad_params) ==1 and isinstance(fp, FlatParameter):
+            # 如果是 flat_param，根据原始参数名称来分组
+            logger.info("\n=== flat_param in FSDP===")
+            # 使用 summon_full_params 恢复并分组参数
+            with FSDP.summon_full_params(model):
+                for name, param in model.named_parameters():
+                    # 根据参数名称或条件决定参数的分组
+                    if "weight" in  name and not any(x in  name for x in ["ln_","bias", "LayerNorm", "layer_norm"]):
                         nodecay_params.append(param)
-            else:
-                #logger.info(name)
-                # 如果不是 flat_param，直接按常规方式分组
+                    else:
+                        decay_params.append(param)
+        else:
+            for name, param in grad_params.items():
                 if "weight" in name and not any(x in name for x in ["ln_","bias", "LayerNorm", "layer_norm"]):
                     decay_params.append(param)
                 else:
@@ -661,13 +664,13 @@ else:
     model = GPT(model_config)
     model.to(device)
     if ddp:
-        model = FSDP(model, use_orig_params=True) #,  , , ,**fsdp_config
+        model = FSDP(model, use_orig_params=False) #,  , , ,**fsdp_config,cpu_offload=CPUOffload
         #model = DDP(model,device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
     logger.info(f"training from scratch with {model_config=}")
 
     # optimize!
-    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
+    optimizer = model.module.configure_optimizers(model,weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
     
 use_compile = False #True   # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
@@ -675,10 +678,10 @@ if use_compile:
 
 logger.info(f"{use_compile=}")
 
-scaler = torch.cuda.amp.GradScaler()
+
 
 def train():
-    global scaler 
+    scaler = ShardedGradScaler()
     for step in range(current_step,max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
@@ -699,13 +702,13 @@ def train():
                     val_loss_accum += loss.detach()
             if master_process:
                 logger.info(f"#{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 5 == 0 or last_step):
 
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                optimizer_state = FSDP.optim_state_dict(model, optimizer)
                 with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                     model_state = model.state_dict()
-                    optimizer_state = FSDP.optim_state_dict(model, optimizer)
                     checkpoint = {
                         'model': model_state,
                         'optimizer': optimizer_state,
@@ -820,17 +823,18 @@ def train():
                 
                 # 反向传播
                 scaler.scale(loss).backward()
-
-        if ddp and isinstance(model, FSDP):
-            torch.cuda.synchronize()
+                
+        if ddp : #and isinstance(model, FSDP)
+            #torch.cuda.synchronize()
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-        # 梯度裁剪前进行 unscale
+
+        # Gradient clipping
         scaler.unscale_(optimizer)
-        
-        # 梯度裁剪
-        norm=model.clip_grad_norm_(1.0)
-        #norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+        if hasattr(model, 'clip_grad_norm_'):
+            norm = model.clip_grad_norm_(1.0)
+        else:
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         # 更新学习率
         lr = get_lr(step)
         for param_group in optimizer.param_groups:

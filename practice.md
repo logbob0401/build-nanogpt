@@ -34,6 +34,8 @@ step   501 | loss: 5.164941 | lr 4.2126e-04 | norm: 0.8869 | dt: 929.10ms | tok/
 ### 尝试更大的模型
 ## todo: fp8 训练,用h800
 ## todo: deepspeed, 
+## fsdp 训练: 遇到困难，看起来直接用有困难，pytorch 支持的fsdp doc有些差，不好用，我准备赚到lightning把原理搞清楚之后先时间出来，实现细节等回头再说。内心更喜欢从c/c++开始的。
+
 
 # 数据load可能有太耗时问题，尝试用数据预取（Data Prefetching）或异步数据加载（Asynchronous Data Loading）优化
 注意load新batch的和新shard的耗时
